@@ -1,0 +1,22 @@
+{
+	"version": "2.0.0",
+	// "options": {
+	// 	"env": {
+	// 		"PDFIUM_STATIC_LIB_PATH": "lib/pdfium-win-x64/lib"
+	// 	}
+	// },
+	"tasks": [
+		{
+			"type": "cargo",
+			"command": "build",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"label": "rust: cargo build"
+		}
+	]
+}
