@@ -6,8 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+eframe = "0.26.0"
+egui_extras = { version = "0.26.0" }
+env_logger = "0.11.1"
+futures = "0.3.30"
 image = "0.24.8"
-tinyfiledialogs = "3.9.1"
+rfd = "0.13.0"
+tokio = { version = "1.36.0", features = ["macros", "rt", "rt-multi-thread"] }
 
 [profile.release]
 lto = "thin"
