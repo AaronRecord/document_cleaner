@@ -16,11 +16,11 @@ impl Default for ImageCleaner {
     fn default() -> Self {
         Self {
             off_white_threshold: 230,
-            speck_size_threshold: 35,
+            speck_size_threshold: 15,
             speck_lightness_threshold: 100,
             speck_margins: (50, 50),
             isolation_distance_threshold: 50,
-            isolation_size_threshold: 50,
+            isolation_size_threshold: 80,
             speck_fill_color: [255, 255, 255],
             off_white_fill_color: [255, 255, 255],
         }
@@ -173,15 +173,15 @@ impl Grapheme {
         image: &DynamicImage,
         new_image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
     ) -> Self {
-        const NEIGHBORS: [(i32, i32); 8] = [
+        const NEIGHBORS: [(i32, i32); 4] = [
             (1, 0),
-            (1, 1),
+            //(1, 1),
             (0, 1),
-            (-1, 1),
+            //(-1, 1),
             (-1, 0),
-            (-1, -1),
+            //(-1, -1),
             (0, -1),
-            (1, -1),
+            //(1, -1),
         ];
 
         let mut grapheme = Self {
