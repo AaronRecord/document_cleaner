@@ -3,9 +3,10 @@ use image::*;
 #[derive(Clone, Copy)]
 pub struct ImageCleaner {
     pub off_white_threshold: u8,
+    pub lightness_threshold: u8,
+    pub lightness_distance: u32,
     pub speck_size_threshold: usize,
-    pub speck_lightness_threshold: u8,
-    pub speck_margins: (u32, u32),
+    pub page_margins: (u32, u32),
     pub isolation_distance_threshold: u32,
     pub isolation_size_threshold: u32,
     pub speck_fill_color: [u8; 3],
@@ -15,10 +16,11 @@ pub struct ImageCleaner {
 impl Default for ImageCleaner {
     fn default() -> Self {
         Self {
-            off_white_threshold: 230,
+            off_white_threshold: 240,
             speck_size_threshold: 15,
-            speck_lightness_threshold: 100,
-            speck_margins: (50, 50),
+            lightness_threshold: 100,
+            lightness_distance: 1,
+            page_margins: (50, 50),
             isolation_distance_threshold: 50,
             isolation_size_threshold: 80,
             speck_fill_color: [255, 255, 255],
@@ -32,11 +34,15 @@ impl ImageCleaner {
         let mut new_image: ImageBuffer<Rgba<u8>, Vec<u8>> =
             ImageBuffer::new(image.width(), image.height());
 
-        // Whiten.
+        // Whiten
         for (x, y, pixel) in image.pixels() {
-            if pixel[0] > self.off_white_threshold
-                && pixel[1] > self.off_white_threshold
-                && pixel[2] > self.off_white_threshold
+            let value = pixel_value(pixel);
+
+            // If the pixel isn't very dark and it's not next to other really dark pixels (like letter borders), fill it.
+            if (value >= self.off_white_threshold)
+                || (value >= self.lightness_threshold
+                    && darkest_pixel_within(x, y, self.lightness_distance, image)
+                        >= self.lightness_threshold)
             {
                 new_image.put_pixel(
                     x,
@@ -58,17 +64,14 @@ impl ImageCleaner {
                 continue;
             }
 
-            let grapheme = Grapheme::detect(x, y, &image, &mut new_image);
+            let grapheme = Grapheme::detect(x, y, image, &mut new_image);
             let too_small = grapheme.pixels.len() <= self.speck_size_threshold;
-            let inside_margins = grapheme.top < self.speck_margins.1
-                || grapheme.bottom >= image.height() - self.speck_margins.1
-                || grapheme.left < self.speck_margins.0
-                || grapheme.right >= image.width() - self.speck_margins.0;
-            let not_dark_enough = grapheme.average_value > self.speck_lightness_threshold;
+            let inside_margins = grapheme.top < self.page_margins.1
+                || grapheme.bottom >= image.height() - self.page_margins.1
+                || grapheme.left < self.page_margins.0
+                || grapheme.right >= image.width() - self.page_margins.0;
 
-            if too_small || inside_margins || not_dark_enough {
-                //println!("Speck removed at x: {}, y: {} too_small: {}, inside_margins: {}, not_dark_enough: {}", grapheme.left, grapheme.top, too_small, inside_margins, not_dark_enough);
-
+            if too_small || inside_margins {
                 // A speck/smudge probably.
                 for pixel in grapheme.pixels {
                     new_image.put_pixel(
@@ -102,7 +105,7 @@ impl ImageCleaner {
                 let index =
                     grapheme_index as i64 + ((1 + i / 2) as i64 * if negative { -1 } else { 1 });
                 let index = if index < 0 {
-                    remaining_graphemes.len() - index.abs() as usize
+                    remaining_graphemes.len() - index.unsigned_abs() as usize
                 } else if index >= remaining_graphemes.len() as i64 {
                     index as usize - remaining_graphemes.len()
                 } else {
@@ -232,13 +235,13 @@ impl Grapheme {
             }
         }
 
-        let mut total: usize = 0;
+        let mut total: u32 = 0;
         for (x, y) in grapheme.pixels.iter() {
             let pixel = image.get_pixel(*x, *y);
-            total += (pixel[0] as usize + pixel[1] as usize + pixel[2] as usize) / 3;
+            total += pixel_value(pixel) as u32;
         }
 
-        grapheme.average_value = (total / grapheme.pixels.len()) as u8;
+        grapheme.average_value = (total / grapheme.pixels.len() as u32) as u8;
 
         grapheme
     }
@@ -250,4 +253,23 @@ fn positive_difference(a: u32, b: u32) -> u32 {
     } else {
         b - a
     }
+}
+
+fn darkest_pixel_within(x: u32, y: u32, distance: u32, image: &DynamicImage) -> u8 {
+    //for pixel in image.view(x - distance, y - distance, distance * 2, distance * 2);
+    let mut darkest: u8 = 255;
+    for y in (y - distance).max(0)..=(y + distance).min(image.height() - 1) {
+        for x in (x - distance).max(0)..=(x + distance).min(image.width() - 1) {
+            let pixel = pixel_value(image.get_pixel(x, y));
+            if pixel < darkest {
+                darkest = pixel;
+            }
+        }
+    }
+
+    darkest
+}
+
+fn pixel_value(pixel: Rgba<u8>) -> u8 {
+    ((pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32) / 3) as u8
 }
