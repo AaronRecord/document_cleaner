@@ -103,20 +103,20 @@ impl ImageCleanup {
             processing_preview_image: Arc::new(Mutex::new(None)),
             preview_image_handle,
             image_paths: Vec::new(),
-            original_preview_image,
             export_progess: Arc::new(Mutex::new(0.0)),
             export_task: None,
             clean_preview_task: None,
             preview_dirty: true,
             preview_speck_fill_color: [255, 0, 255],
             preview_off_white_fill_color: [255, 255, 255],
-            preview_zoom: -0.025,
+            preview_zoom: 0.0,
             preview_min_zoom: -1.0,
             preview_max_zoom: 8.0,
             preview_zoom_speed: 0.0025,
             preview_offset: Vec2::ZERO,
             preview_velocity: Vec2::ZERO,
             preview_margin_color: Color32::from_rgba_unmultiplied(0, 0, 255, 128),
+            original_preview_image,
         }
     }
 
@@ -358,6 +358,18 @@ impl eframe::App for ImageCleanup {
                             .step_by(0.01),
                         );
                         ui.end_row();
+
+                        ui.label("Offset");
+                        ui.end_row();
+
+                        ui.label("\t- x");
+                        ui.add(DragValue::new(&mut self.preview_offset.x).suffix("px"));
+
+                        ui.end_row();
+
+                        ui.label("\t- y");
+                        ui.add(DragValue::new(&mut self.preview_offset.y).suffix("px"));
+                        ui.end_row();
                     });
             });
 
@@ -365,8 +377,19 @@ impl eframe::App for ImageCleanup {
             .frame(eframe::egui::Frame::none().fill(Color32::from_rgb(27, 26, 31)))
             .show(ctx, |ui| {
                 if ui.max_rect().area() < 1.0 {
-                    // Prevents a crash
+                    // Prevents a crash when shrinking the Panel
                     return;
+                }
+
+                // Use arrow keys to change page
+                if ctx.input(|i| i.key_pressed(Key::ArrowRight))
+                    && (self.preview_page as usize) < self.image_paths.len()
+                {
+                    self.preview_page += 1;
+                    self.new_preview_image();
+                } else if ctx.input(|i| i.key_pressed(Key::ArrowLeft)) && self.preview_page > 1 {
+                    self.preview_page -= 1;
+                    self.new_preview_image();
                 }
 
                 ui.set_clip_rect(ui.max_rect());
@@ -386,10 +409,12 @@ impl eframe::App for ImageCleanup {
                     self.original_preview_image.width() as f32,
                     self.original_preview_image.height() as f32,
                 );
+
                 // The ratio of whichever dimension has the largest difference between it and the available ui space (usually vertical for portrait pages)
                 let largest_dimension = (image_dimensions.x / ui.available_width())
                     .max(image_dimensions.y / ui.available_height());
                 let mut zoom = 2f32.powf(self.preview_zoom);
+                let mut rect = Rect::ZERO;
 
                 macro_rules! image_to_ui_scale {
                     ($v:expr) => {
@@ -404,18 +429,19 @@ impl eframe::App for ImageCleanup {
                 }
 
                 macro_rules! image_to_ui_pixels {
-                    ($v:expr, $rect:expr) => {
-                        $rect.left_top() + image_to_ui_scale!($v)
+                    ($v:expr) => {
+                        rect.left_top() + image_to_ui_scale!($v)
                     };
                 }
 
                 macro_rules! ui_to_image_pixels {
-                    ($v:expr, $rect:expr) => {
-                        ui_to_image_scale!($v - $rect.left_top()) - self.preview_offset
+                    ($v:expr) => {
+                        ui_to_image_scale!($v - rect.left_top())
                     };
                 }
 
-                macro_rules! calc_rect {
+                // The rect that the preview image should be drawn in
+                macro_rules! calc_ui_rect {
                     () => {
                         Rect::from_center_size(
                             ui.max_rect().center() + image_to_ui_scale!(self.preview_offset),
@@ -424,27 +450,43 @@ impl eframe::App for ImageCleanup {
                     };
                 }
 
-                let previous_rect = calc_rect!();
+                rect = calc_ui_rect!();
+                let mouse_pos =
+                    ctx.input(|i| i.pointer.latest_pos().unwrap_or(ui.max_rect().center()));
+                let mouse_hover_pixel = ui_to_image_pixels!(mouse_pos);
+
+                let mut zooming = false;
 
                 // Scroll to zoom
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                 let scrolling = scroll_delta.abs() > 0.05;
-
                 if scrolling {
-                    self.preview_zoom = (self.preview_zoom
-                        + scroll_delta * self.preview_zoom_speed)
+                    self.preview_zoom = self.preview_zoom + scroll_delta * self.preview_zoom_speed;
+                    zooming = true;
+                }
+                if ui.input(|i| i.key_pressed(Key::Equals)) {
+                    self.preview_zoom += 1.0;
+                    zooming = true;
+                }
+                if ui.input(|i| i.key_pressed(Key::Minus)) {
+                    self.preview_zoom -= 1.0;
+                    zooming = true;
+                }
+
+                if zooming {
+                    self.preview_zoom = self
+                        .preview_zoom
                         .max(self.preview_min_zoom)
                         .min(self.preview_max_zoom);
 
                     // Stop velocity when zooming.
                     self.preview_velocity = Vec2::ZERO;
                     zoom = 2f32.powf(self.preview_zoom);
+
+                    rect = calc_ui_rect!();
+                    let new_mouse_hover_pixel = ui_to_image_pixels!(mouse_pos);
+                    self.preview_offset += new_mouse_hover_pixel - mouse_hover_pixel;
                 }
-
-                let mouse_pos =
-                    ctx.input(|i| i.pointer.latest_pos().unwrap_or(ui.max_rect().center()));
-
-                let previous_mouse_hover_pixel = ui_to_image_pixels!(mouse_pos, previous_rect);
 
                 // Drag to pan
                 let content_response = ui.interact(ui.max_rect(), ui.id(), Sense::drag());
@@ -473,24 +515,14 @@ impl eframe::App for ImageCleanup {
                     }
                 }
 
-                let panned_zoomed_rect = calc_rect!();
-                let new_mouse_hover_pixel = ui_to_image_pixels!(mouse_pos, panned_zoomed_rect);
-                println!(
-                    "{:?} {:?}",
-                    previous_mouse_hover_pixel.sub(new_mouse_hover_pixel),
-                    new_mouse_hover_pixel
+                // Clamp the preview offset
+                self.preview_offset = self.preview_offset.clamp(
+                    -(image_dimensions / 2.0) - ui_to_image_scale!(ui.max_rect().size()) / 4.0,
+                    (image_dimensions / 2.0) + (ui_to_image_scale!(ui.max_rect().size()) / 4.0),
                 );
 
-                // Keep the mouse hovered over the same image pixel
-                self.preview_offset += previous_mouse_hover_pixel.sub(new_mouse_hover_pixel);
+                rect = calc_ui_rect!();
 
-                // Clamp the preview offset
-                /*self.preview_offset = self.preview_offset.clamp(
-                    -ui_to_image_scale!(ui.max_rect().size()),
-                    image_dimensions + ui_to_image_scale!(ui.max_rect().size()),
-                );*/
-
-                let rect = calc_rect!();
                 let painter = ui.painter();
 
                 painter.image(
@@ -520,10 +552,7 @@ impl eframe::App for ImageCleanup {
                     ),
                 ] {
                     painter.rect_filled(
-                        Rect::from_two_pos(
-                            image_to_ui_pixels!(a, rect),
-                            image_to_ui_pixels!(b, rect),
-                        ),
+                        Rect::from_two_pos(image_to_ui_pixels!(a), image_to_ui_pixels!(b)),
                         0.0,
                         self.preview_margin_color,
                     );
