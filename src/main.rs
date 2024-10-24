@@ -1,12 +1,11 @@
 //#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use std::ops::Sub;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::*;
 use image::*;
-use image_cleanup::ImageCleaner;
+use image_cleanup::*;
 use tokio::task::JoinHandle;
 
 #[tokio::main]
@@ -27,20 +26,28 @@ async fn main() -> Result<(), eframe::Error> {
 }
 
 struct ImageCleanup {
+    analyzer: ImageAnalyzer,
     cleaner: ImageCleaner,
-    original_preview_image: DynamicImage,
+
+    preview_image_width: u32,
+    preview_image_height: u32,
+    analyzed_preview_image: Arc<Mutex<AnalyzedImage>>,
+    cleaned_preview_image: Arc<Mutex<RgbImage>>,
     preview_image_handle: TextureHandle,
-    processing_preview_image: Arc<Mutex<Option<DynamicImage>>>,
+
     image_paths: Vec<PathBuf>,
-    export_progess: Arc<Mutex<f32>>,
+
+    analyze_preview_task: Option<JoinHandle<()>>,
+    clean_preview_task: Option<JoinHandle<()>>,
     export_task: Option<JoinHandle<()>>,
+    export_progess: Arc<Mutex<f32>>,
 
     // Preview settings
-    clean_preview_task: Option<JoinHandle<()>>,
-    preview_dirty: bool,
+    previews_needs_analyze: bool,
+    previews_needs_clean: bool,
     preview_page: u16,
     preview_speck_fill_color: [u8; 3],
-    preview_off_white_fill_color: [u8; 3],
+    preview_background_fill_color: [u8; 3],
     preview_zoom: f32,
     preview_zoom_speed: f32,
     preview_min_zoom: f32,
@@ -50,19 +57,14 @@ struct ImageCleanup {
     preview_margin_color: Color32,
 }
 
-fn dynamic_image_to_color_image(image: &DynamicImage) -> ColorImage {
+fn rgb_image_to_color_image(image: &RgbImage) -> ColorImage {
     let size = [image.width() as _, image.height() as _];
-    let image_buffer = image.to_rgba8();
-    let pixels = image_buffer.as_flat_samples();
-    ColorImage::from_rgba_unmultiplied(size, pixels.as_slice())
+    let pixels = image.as_flat_samples();
+    ColorImage::from_rgb(size, pixels.as_slice())
 }
 
-fn dynamic_image_to_handle(
-    ctx: &Context,
-    name: impl Into<String>,
-    image: &DynamicImage,
-) -> TextureHandle {
-    let image = dynamic_image_to_color_image(image);
+fn rgb_image_to_handle(ctx: &Context, name: impl Into<String>, image: &RgbImage) -> TextureHandle {
+    let image = rgb_image_to_color_image(image);
     ctx.load_texture(
         name,
         image,
@@ -74,9 +76,10 @@ fn dynamic_image_to_handle(
     )
 }
 
-fn demo_image() -> DynamicImage {
+fn demo_image() -> RgbImage {
     image::load_from_memory_with_format(include_bytes!("../assets/demo_page.png"), ImageFormat::Png)
         .unwrap()
+        .to_rgb8()
 }
 
 fn icon_image() -> IconData {
@@ -94,21 +97,36 @@ fn icon_image() -> IconData {
 impl ImageCleanup {
     fn new(ctx: &Context) -> Self {
         let original_preview_image = demo_image();
-        let preview_image_handle =
-            dynamic_image_to_handle(ctx, "preview_image", &original_preview_image);
+        let analyzer = ImageAnalyzer::default();
+        let analyzed_image = analyzer.analyze(&original_preview_image);
+        let cleaner = ImageCleaner::default();
+
+        let preview_speck_fill_color = [255, 0, 255];
+        let preview_background_fill_color = [255, 255, 255];
+        let preview_cleaner = ImageCleaner {
+            speck_fill_color: preview_speck_fill_color,
+            background_fill_color: preview_background_fill_color,
+            ..cleaner
+        };
+        let cleaned_image = preview_cleaner.clean(&analyzed_image);
+        let preview_image_handle = rgb_image_to_handle(ctx, "preview_image", &cleaned_image);
 
         Self {
-            cleaner: ImageCleaner::default(),
+            analyzer,
+            cleaner,
             preview_page: 1,
-            processing_preview_image: Arc::new(Mutex::new(None)),
+            analyzed_preview_image: Arc::new(Mutex::new(analyzed_image)),
+            cleaned_preview_image: Arc::new(Mutex::new(cleaned_image)),
             preview_image_handle,
             image_paths: Vec::new(),
-            export_progess: Arc::new(Mutex::new(0.0)),
-            export_task: None,
+            analyze_preview_task: None,
             clean_preview_task: None,
-            preview_dirty: true,
-            preview_speck_fill_color: [255, 0, 255],
-            preview_off_white_fill_color: [255, 255, 255],
+            export_task: None,
+            export_progess: Arc::new(Mutex::new(0.0)),
+            previews_needs_analyze: false,
+            previews_needs_clean: false,
+            preview_speck_fill_color,
+            preview_background_fill_color,
             preview_zoom: 0.0,
             preview_min_zoom: -1.0,
             preview_max_zoom: 8.0,
@@ -116,7 +134,8 @@ impl ImageCleanup {
             preview_offset: Vec2::ZERO,
             preview_velocity: Vec2::ZERO,
             preview_margin_color: Color32::from_rgba_unmultiplied(0, 0, 255, 128),
-            original_preview_image,
+            preview_image_width: original_preview_image.width(),
+            preview_image_height: original_preview_image.height(),
         }
     }
 
@@ -126,24 +145,20 @@ impl ImageCleanup {
     }
 
     fn new_preview_image(&mut self) {
-        self.original_preview_image = if !self.image_paths.is_empty() {
-            image::io::Reader::open(&self.image_paths[(self.preview_page - 1) as usize])
-                .unwrap()
-                .decode()
-                .unwrap()
-        } else {
-            demo_image()
-        };
-
-        self.clean_preview();
+        self.queue_analyze_preview();
     }
 
-    fn clean_preview(&mut self) {
-        self.preview_dirty = true;
+    fn queue_analyze_preview(&mut self) {
+        self.previews_needs_analyze = true;
+    }
+
+    fn queue_clean_preview(&mut self) {
+        self.previews_needs_clean = true;
     }
 
     async fn export_all(
         image_paths: Vec<PathBuf>,
+        analyzer: ImageAnalyzer,
         cleaner: ImageCleaner,
         progress: Arc<Mutex<f32>>,
     ) {
@@ -152,8 +167,13 @@ impl ImageCleanup {
         for (i, path) in image_paths.iter().enumerate() {
             tokio::task::yield_now().await;
             *progress.lock().unwrap() = (i + 1) as f32 / image_paths.len() as f32;
-            let image = image::io::Reader::open(path).unwrap().decode().unwrap();
-            let cleaned_image = cleaner.clean(&image);
+            let image = image::io::Reader::open(path)
+                .unwrap()
+                .decode()
+                .unwrap()
+                .to_rgb8();
+            let analyzed_image = analyzer.analyze(&image);
+            let cleaned_image = cleaner.clean(&analyzed_image);
             cleaned_image.save(path).unwrap();
         }
     }
@@ -161,74 +181,121 @@ impl ImageCleanup {
 
 impl eframe::App for ImageCleanup {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        if self.preview_dirty {
-            (|| {
-                if let Some(task) = &self.clean_preview_task {
-                    if !task.is_finished() {
-                        return;
-                    }
-                }
+        // Here's how it works:
+        // When the preview image is changed, it gets analyzed.
+        if let Some(analyze_task) = &self.analyze_preview_task {
+            if analyze_task.is_finished() {
+                self.analyze_preview_task = None;
+                // Then the program is told to clean the preview, using the new AnalyzedImage.
+                // (It's also told to clean every time the user makes changes to the cleaner parameters)
+                self.queue_clean_preview();
+            }
+        }
 
-                self.preview_dirty = false;
+        let is_analyzing = self.analyze_preview_task.is_some();
+        if self.previews_needs_analyze && !is_analyzing {
+            self.previews_needs_analyze = false;
 
-                let cleaner = ImageCleaner {
-                    speck_fill_color: self.preview_speck_fill_color,
-                    off_white_fill_color: self.preview_off_white_fill_color,
-                    ..self.cleaner
-                };
+            let original_preview_image = if !self.image_paths.is_empty() {
+                image::io::Reader::open(&self.image_paths[(self.preview_page - 1) as usize])
+                    .unwrap()
+                    .decode()
+                    .unwrap()
+                    .to_rgb8()
+            } else {
+                demo_image()
+            };
 
-                let handle = self.processing_preview_image.clone();
-                let original_preview_image = self.original_preview_image.clone();
-                self.clean_preview_task = Some(tokio::spawn(async move {
-                    let mut handle = handle.lock().unwrap();
-                    let clean_preview_image = cleaner.clean(&original_preview_image);
-                    *handle = Some(clean_preview_image);
-                }));
-            })();
+            self.preview_image_width = original_preview_image.width();
+            self.preview_image_height = original_preview_image.height();
+
+            let analyzer = self.analyzer;
+            let analyzed_handle = self.analyzed_preview_image.clone();
+            self.analyze_preview_task = Some(tokio::spawn(async move {
+                let analyzed = analyzer.analyze(&original_preview_image);
+                *analyzed_handle.lock().unwrap() = analyzed;
+            }));
+        }
+
+        if let Some(clean_task) = &self.clean_preview_task {
+            if clean_task.is_finished() {
+                self.clean_preview_task = None;
+                // Then once it's done cleaning, update the user's preview.
+                self.preview_image_handle = rgb_image_to_handle(
+                    ctx,
+                    "preview_image",
+                    &*self.cleaned_preview_image.lock().unwrap(),
+                );
+            }
+        }
+
+        let is_cleaning = self.clean_preview_task.is_some();
+
+        let mut processing = is_analyzing || is_cleaning;
+        if self.previews_needs_clean && !processing {
+            processing = true;
+            self.previews_needs_clean = false;
+
+            let cleaner = ImageCleaner {
+                speck_fill_color: self.preview_speck_fill_color,
+                background_fill_color: self.preview_background_fill_color,
+                ..self.cleaner
+            };
+
+            let analyzed_handle = self.analyzed_preview_image.clone();
+            let cleaned_handle = self.cleaned_preview_image.clone();
+            self.clean_preview_task = Some(tokio::spawn(async move {
+                let analyzed = &*analyzed_handle.lock().unwrap();
+                *cleaned_handle.lock().unwrap() = cleaner.clean(analyzed);
+            }));
         }
 
         SidePanel::right("parameters").resizable(false).show(ctx, |ui| {
             ui.heading("Import parameters");
-            if ui.button("Open images…").clicked() {
-                let extensions: Vec<&str> = [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Tiff, ImageFormat::WebP].into_iter().flat_map(|f| f.extensions_str().iter().copied()).collect();
-                if let Some(paths) = rfd::FileDialog::new().add_filter("Image files", extensions.as_slice()).pick_files() {
-                    self.on_images_update(paths);
-                }
-            }
-            ui.separator();
-
-            ui.heading("Cleanup parameters");
-            Grid::new("parameters")
+            Grid::new("import_parameters")
                 .spacing([40.0, 4.0])
                 .striped(true)
                 .show(ui, |ui| {
-                    ui.end_row();
-
                     ui.label("Off-white threshold")
-                        .on_hover_text("Colors with their r, g, and b values greater than this are considered off-white, and will be filled");
-                    if ui.add(Slider::new(&mut self.cleaner.off_white_threshold, 0..=255)).changed() {
-                        self.clean_preview();
-                    }
+                        .on_hover_text("Pixels whose mean rgb value is lighter than this are considered off-white, and will be filled");
+                    ui.add(Slider::new(&mut self.analyzer.off_white_threshold, 0..=255));
                     ui.end_row();
 
-                    ui.label("Lightness threshold");
-                        //.on_hover_text("Clusters that have an average rgb value greater than this will be filled");
-                    if ui.add(Slider::new(&mut self.cleaner.lightness_threshold, 0..=255)).changed() {
-                        self.clean_preview();
-                    }
+                    ui.label("Lightness thresholds")
+                        .on_hover_text("Pixels whose mean rgb value is lighter than lightness and that don't have another pixel within distance (perpendicular distance) that is lighter than lightness will be filled");
                     ui.end_row();
 
-                    ui.label("Lightness distance");
-                        //.on_hover_text("Clusters that have an average rgb value greater than this will be filled");
-                    if ui.add(Slider::new(&mut self.cleaner.lightness_distance, 0..=10)).changed() {
-                        self.clean_preview();
-                    }
+                    ui.label("\t- Lightness");
+                    ui.add(Slider::new(&mut self.analyzer.lightness_threshold, 0..=255));
                     ui.end_row();
 
+                    ui.label("\t- Distance");
+                    ui.add(Slider::new(&mut self.analyzer.lightness_distance, 0..=10));
+                    ui.end_row();
+
+                    if ui.button("Open images…").clicked() {
+                        let extensions: Vec<&str> = [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Tiff, ImageFormat::WebP].into_iter().flat_map(|f| f.extensions_str().iter().copied()).collect();
+                        if let Some(paths) = rfd::FileDialog::new().add_filter("Image files", extensions.as_slice()).pick_files() {
+                            self.on_images_update(paths);
+                        }
+                    }
+
+                    if ui.button("Reimport").clicked() {
+                        self.queue_analyze_preview();
+                    }
+                });
+
+            ui.separator();
+
+            ui.heading("Cleanup parameters");
+            Grid::new("cleaner_parameters")
+                .spacing([40.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
                     ui.label("Speck size threshold")
                         .on_hover_text("Clusters that have an area smaller than this will be filled");
                     if ui.add(Slider::new(&mut self.cleaner.speck_size_threshold, 0..=60).clamp_to_range(false).suffix("px²")).changed() {
-                        self.clean_preview();
+                        self.queue_clean_preview();
                     }
                     ui.end_row();
 
@@ -238,48 +305,48 @@ impl eframe::App for ImageCleanup {
 
                     ui.label("\t- x");
                     if ui.add(Slider::new(&mut self.cleaner.page_margins.0, 0..=100).clamp_to_range(false).suffix("px")).changed() {
-                        self.clean_preview();
+                        self.queue_clean_preview();
                     }
                     ui.end_row();
 
                     ui.label("\t- y");
                     if ui.add(Slider::new(&mut self.cleaner.page_margins.1, 0..=100).clamp_to_range(false).suffix("px")).changed() {
-                        self.clean_preview();
+                        self.queue_clean_preview();
                     }
                     ui.end_row();
 
 
                     ui.label("Isolation thresholds")
-                        .on_hover_text(" (Clusters that have an area smaller than this and aren't within this distance of another cluster that is will be filled");
+                        .on_hover_text("(Clusters that have an area smaller than this and aren't within this distance of another cluster that is will be filled");
                     ui.end_row();
 
-                    ui.label("\t- size");
+                    ui.label("\t- Size");
                     if ui.add(Slider::new(&mut self.cleaner.isolation_size_threshold, 0..=150).clamp_to_range(false).suffix("px²")).changed() {
-                        self.clean_preview();
+                        self.queue_clean_preview();
                     }
                     ui.end_row();
-                    ui.label("\t- distance");
+                    ui.label("\t- Distance");
                     if ui.add(Slider::new(&mut self.cleaner.isolation_distance_threshold, 0..=200).clamp_to_range(false).suffix("px")).changed() {
-                        self.clean_preview();
+                        self.queue_clean_preview();
                     }
                     ui.end_row();
 
                     ui.label("Speck fill color")
-                        .on_hover_text("What color to fill in specks, useful for verification");
+                        .on_hover_text("What color to fill in specks (useful for debugging).");
                     if ui.color_edit_button_srgb(&mut self.cleaner.speck_fill_color).changed() {
-                        self.clean_preview();
+                        self.queue_clean_preview();
                     }
                     ui.end_row();
 
-                    ui.label("Off-white fill color")
-                        .on_hover_text("What color to fill in off-white pixels, useful for verification");
-                    if ui.color_edit_button_srgb(&mut self.cleaner.off_white_fill_color).changed() {
-                        self.clean_preview();
+                    ui.label("Background fill color")
+                        .on_hover_text("What color to fill in the background (useful for debugging).");
+                    if ui.color_edit_button_srgb(&mut self.cleaner.background_fill_color).changed() {
+                        self.queue_clean_preview();
                     }
                     ui.end_row();
 
 					if ui.add_enabled(!self.image_paths.is_empty() && self.export_task.is_none(), Button::new("Export all")).on_disabled_hover_text("No images have been opened or they are currently exporting").clicked() {
-                        self.export_task = Some(tokio::spawn(Self::export_all(self.image_paths.clone(), self.cleaner, self.export_progess.clone())));
+                        self.export_task = Some(tokio::spawn(Self::export_all(self.image_paths.clone(), self.analyzer, self.cleaner, self.export_progess.clone())));
 					}
 
 
@@ -332,16 +399,16 @@ impl eframe::App for ImageCleanup {
                             .color_edit_button_srgb(&mut self.preview_speck_fill_color)
                             .changed()
                         {
-                            self.clean_preview();
+                            self.queue_clean_preview();
                         }
                         ui.end_row();
 
                         ui.label("Preview off-white fill color");
                         if ui
-                            .color_edit_button_srgb(&mut self.preview_off_white_fill_color)
+                            .color_edit_button_srgb(&mut self.preview_background_fill_color)
                             .changed()
                         {
-                            self.clean_preview();
+                            self.queue_clean_preview();
                         }
                         ui.end_row();
 
@@ -394,20 +461,9 @@ impl eframe::App for ImageCleanup {
 
                 ui.set_clip_rect(ui.max_rect());
 
-                let mut processing = false;
-                if let Ok(mut mutex) = self.processing_preview_image.try_lock() {
-                    if let Some(preview_image) = &*mutex {
-                        self.preview_image_handle =
-                            dynamic_image_to_handle(ctx, "preview_image", preview_image);
-                        *mutex = None;
-                    }
-                } else {
-                    processing = true;
-                }
-
                 let image_dimensions = Vec2::new(
-                    self.original_preview_image.width() as f32,
-                    self.original_preview_image.height() as f32,
+                    self.preview_image_width as f32,
+                    self.preview_image_height as f32,
                 );
 
                 // The ratio of whichever dimension has the largest difference between it and the available ui space (usually vertical for portrait pages)
